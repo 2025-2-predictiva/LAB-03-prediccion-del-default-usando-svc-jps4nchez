@@ -95,3 +95,249 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+import os
+import json
+import gzip
+import pickle
+import zipfile
+from typing import Tuple, List, Dict, Any
+
+import pandas as pd
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.model_selection import GridSearchCV
+from sklearn.decomposition import PCA
+from sklearn.svm import SVC
+from sklearn.metrics import (
+    balanced_accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    confusion_matrix,
+)
+
+
+def load_data() -> Tuple[pd.DataFrame, pd.DataFrame]:
+
+    file_test = "files/input/test_data.csv.zip"
+    file_train = "files/input/train_data.csv.zip"
+
+    with zipfile.ZipFile(file_test, "r") as zipf:
+        with zipf.open("test_default_of_credit_card_clients.csv") as f:
+            df_test = pd.read_csv(f)
+
+    with zipfile.ZipFile(file_train, "r") as zipf:
+        with zipf.open("train_default_of_credit_card_clients.csv") as f:
+            df_train = pd.read_csv(f)
+
+    return df_train, df_test
+
+
+def clean_data(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Limpia el dataset según las reglas del enunciado.
+    - Renombra la columna objetivo.
+    - Elimina ID.
+    - Elimina NAs.
+    - Filtra EDUCATION y MARRIAGE != 0.
+    - Agrupa EDUCATION > 4 en categoría 4 (otros).
+    """
+    df = df.copy()
+    df = df.drop("ID", axis=1)
+    df = df.rename(columns={"default payment next month": "default"})
+    df = df.dropna()
+    df = df[(df["EDUCATION"] != 0) & (df["MARRIAGE"] != 0)]
+    df.loc[df["EDUCATION"] > 4, "EDUCATION"] = 4
+    return df
+
+
+def split(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
+    """Separa X (features) e y (target)."""
+    X = df.drop("default", axis=1)
+    y = df["default"]
+    return X, y
+
+
+def build_pipeline() -> Pipeline:
+    """
+    Crea el pipeline:
+    - OneHotEncoder para variables categóricas.
+    - StandardScaler para numéricas.
+    - PCA.
+    - SelectKBest.
+    - SVC (SVM).
+    """
+    categories = ["SEX", "EDUCATION", "MARRIAGE"]
+    numerics = [
+        "LIMIT_BAL",
+        "AGE",
+        "PAY_0",
+        "PAY_2",
+        "PAY_3",
+        "PAY_4",
+        "PAY_5",
+        "PAY_6",
+        "BILL_AMT1",
+        "BILL_AMT2",
+        "BILL_AMT3",
+        "BILL_AMT4",
+        "BILL_AMT5",
+        "BILL_AMT6",
+        "PAY_AMT1",
+        "PAY_AMT2",
+        "PAY_AMT3",
+        "PAY_AMT4",
+        "PAY_AMT5",
+        "PAY_AMT6",
+    ]
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("cat", OneHotEncoder(handle_unknown="ignore"), categories),
+            ("scaler", StandardScaler(), numerics),
+        ],
+        remainder="passthrough",
+    )
+
+    selectkbest = SelectKBest(score_func=f_classif)
+
+    pipeline = Pipeline(
+        steps=[
+            ("preprocessor", preprocessor),
+            ("pca", PCA()),
+            ("selectkbest", selectkbest),
+            ("classifier", SVC(kernel="rbf", random_state=42)),
+        ]
+    )
+
+    return pipeline
+
+
+def tune_hyperparameters(
+    model: Pipeline,
+    n_splits: int,
+    x_train: pd.DataFrame,
+    y_train: pd.Series,
+    scoring: str = "balanced_accuracy",
+) -> GridSearchCV:
+    """
+    Ajusta los hiperparámetros con GridSearchCV.
+    """
+    estimator = GridSearchCV(
+        estimator=model,
+        param_grid={
+            "pca__n_components": [20, 21],
+            "selectkbest__k": [12],
+            "classifier__kernel": ["rbf"],
+            "classifier__gamma": [0.099],
+        },
+        cv=n_splits,
+        refit=True,
+        verbose=1,
+        return_train_score=False,
+        scoring=scoring,
+    )
+
+    estimator.fit(x_train, y_train)
+    return estimator
+
+
+def compute_metrics(name: str, y_true, y_pred) -> Dict[str, Any]:
+    """Calcula métricas estándar de clasificación."""
+    return {
+        "type": "metrics",
+        "dataset": name,
+        "precision": precision_score(y_true, y_pred, zero_division=0),
+        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+        "recall": recall_score(y_true, y_pred, zero_division=0),
+        "f1_score": f1_score(y_true, y_pred, zero_division=0),
+    }
+
+
+def compute_confusion(name: str, y_true, y_pred) -> Dict[str, Any]:
+    """
+    Calcula la matriz de confusión:
+    true_0 / true_1 con predicted_0 / predicted_1.
+    """
+    cm = confusion_matrix(y_true, y_pred)
+    return {
+        "type": "cm_matrix",
+        "dataset": name,
+        "true_0": {
+            "predicted_0": int(cm[0, 0]),
+            "predicted_1": int(cm[0, 1]),
+        },
+        "true_1": {
+            "predicted_0": int(cm[1, 0]),
+            "predicted_1": int(cm[1, 1]),
+        },
+    }
+
+
+def save_model(model: Any, path: str = "files/models/model.pkl.gz") -> None:
+    """Guarda el modelo comprimido con gzip."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with gzip.open(path, "wb") as f:
+        pickle.dump(model, f)
+
+
+def save_metrics(
+    results: List[Dict[str, Any]], path: str = "files/output/metrics.json"
+) -> None:
+    """Guarda métricas y matrices de confusión en formato JSON lines."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        for metric in results:
+            json_line = json.dumps(metric)
+            f.write(json_line + "\n")
+
+
+def main() -> None:
+
+    # 1. Cargar datos
+    df_train, df_test = load_data()
+
+    # 2. Limpiar
+    df_train = clean_data(df_train)
+    df_test = clean_data(df_test)
+
+    # 3. Dividir
+    x_train, y_train = split(df_train)
+    x_test, y_test = split(df_test)
+
+    # 4. Pipeline + GridSearch
+    model_pipeline = build_pipeline()
+    model_pipeline = tune_hyperparameters(
+        model_pipeline,
+        n_splits=10,
+        x_train=x_train,
+        y_train=y_train,
+        scoring="balanced_accuracy",
+    )
+
+    # 5. Guardar modelo
+    save_model(model_pipeline, "files/models/model.pkl.gz")
+
+    # 6. Predicciones
+    y_train_pred = model_pipeline.predict(x_train)
+    y_test_pred = model_pipeline.predict(x_test)
+
+    # 7. Métricas y matrices
+    train_metrics = compute_metrics("train", y_train, y_train_pred)
+    test_metrics = compute_metrics("test", y_test, y_test_pred)
+
+    train_matrix = compute_confusion("train", y_train, y_train_pred)
+    test_matrix = compute_confusion("test", y_test, y_test_pred)
+
+    # 8. Guardar en metrics.json
+    save_metrics(
+        [train_metrics, test_metrics, train_matrix, test_matrix],
+        "files/output/metrics.json",
+    )
+
+
+if __name__ == "__main__":
+    main()
